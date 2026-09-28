@@ -1,0 +1,1468 @@
+//+------------------------------------------------------------------+
+//|                                              LorisBoard.mq5      |
+//|                                    Desenvolvido para Lori        |
+//|                                    Dashboard multi-ativo MT5     |
+//+------------------------------------------------------------------+
+#property copyright "Lori"
+#property version   "1.00"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+//--- Enumerações
+enum ENUM_MODO_EA
+  {
+   MODO_DAYTRADE = 0,   // Daytrade (1 posição por ativo)
+   MODO_SWING    = 1    // Swing (reentradas, 1 por dia)
+  };
+
+enum ENUM_TIPO_SAIDA
+  {
+   SAIDA_MAX_N_BARRAS = 0,  // Close[0] > High das últimas N barras
+   SAIDA_HORARIO      = 1,  // Fecha no horário configurado
+   SAIDA_CRUZ_INVERSO = 2,  // MM9 cruza MM32 para baixo
+   SAIDA_PERCENTUAL   = 3,  // X% de lucro
+   SAIDA_NUNCA        = 4   // Buy & Hold (não fecha)
+  };
+
+//--- Estrutura de cada entrada individual
+struct EntradaInfo
+  {
+   ulong    ticket;
+   double   volume;
+   datetime dataAbertura;
+   double   precoEntrada;
+   bool     ativa;
+  };
+
+//--- Estrutura de cada ativo/linha do painel
+struct AtivoConfig
+  {
+   string       simbolo;
+   int          magic;
+   double       loteManual;
+   double       maxContratosDia;
+   double       maxContratosTotal;
+
+   int          hMM9_M5;
+   int          hMM32_M5;
+   int          hMM100_M5;
+   int          hMM9_D1;
+   int          hMM5_Saida;
+
+   bool         filtroD1OK;
+   bool         gatilhoEntradaOK;
+   bool         gatilhoSaidaOK;
+
+   double       volumeAtual;
+   double       pnlAtual;
+   datetime     ultimaEntrada;
+   int          entradasHoje;
+   datetime     diaReferencia;
+
+   EntradaInfo  entradas[];
+  };
+
+//+------------------------------------------------------------------+
+//| INPUTS                                                            |
+//+------------------------------------------------------------------+
+input group "=== CONFIGURAÇÃO GERAL ==="
+input ENUM_MODO_EA   InpModoEA          = MODO_DAYTRADE;   // Modo de operação
+input int            InpNumeroLinhas    = 20;              // Número de linhas (ativos)
+input int            InpMagicBase       = 1000;            // Magic base (1000 → 1001, 1002...)
+input int            InpSlippage        = 20;              // Slippage (pontos)
+
+input group "=== LISTA DE ATIVOS ==="
+input string         InpListaAtivos     = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURGBP,EURJPY,GBPJPY"; // Símbolos separados por vírgula
+
+input group "=== LOTE E LIMITES (por linha, separados por vírgula) ==="
+input string         InpListaLotes      = "0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01"; // Lote por ativo
+input string         InpListaMaxDia     = "100,100,100,100,100,100,100,100,100,100";             // Máx. contratos por dia
+input string         InpListaMaxTotal   = "100,100,100,100,100,100,100,100,100,100";             // Máx. contratos acumulado (swing)
+
+input group "=== HORÁRIO ==="
+input bool           InpUsarHorario     = true;            // Usar janela de horário? (false = 24h/swing)
+input int            InpHoraInicio      = 10;              // Hora início
+input int            InpMinutoInicio    = 10;              // Minuto início
+input int            InpHoraFim         = 16;              // Hora fim
+input int            InpMinutoFim       = 40;              // Minuto fim
+input group "=== INDICADORES (M5) ==="
+input int            InpPeriodoMM9      = 9;               // Período MM9 (M5)
+input int            InpPeriodoMM32     = 32;              // Período MM32 (M5)
+input int            InpPeriodoMM100    = 100;             // Período MM100 (M5)
+
+input group "=== FILTRO D1 ==="
+input int            InpPeriodoMM9_D1   = 9;               // Período MM9 (D1)
+
+input group "=== SAÍDA ==="
+input ENUM_TIPO_SAIDA InpTipoSaida      = SAIDA_MAX_N_BARRAS; // Tipo de saída
+input ENUM_TIMEFRAMES InpTF_Saida       = PERIOD_M5;       // TF do MM5 de saída
+input int            InpPeriodoMM5      = 5;               // Período MM5 (saída)
+input int            InpNumBarrasSaida  = 5;               // Nº de barras p/ máxima
+input double         InpPercentualLucro = 1.0;             // % de lucro (saída percentual)
+
+input group "=== PERFORMANCE ==="
+input int            InpSegundosCheck   = 2;               // Intervalo entre checagens (segundos)
+input bool           InpLogDetalhado    = false;           // Log detalhado no terminal
+
+input group "=== PAINEL ==="
+input int            InpPainelX         = 20;              // Painel X
+input int            InpPainelY         = 30;              // Painel Y
+input int            InpAlturaLinha     = 22;              // Altura da linha (px)
+input color          InpCorFundo        = clrBlack;        // Cor de fundo
+input color          InpCorTexto        = clrWhite;        // Cor do texto
+input color          InpCorVerde        = clrLime;         // Cor verde (OK)
+input color          InpCorVermelho     = clrRed;          // Cor vermelha (falha)
+input color          InpCorNeutro       = clrGray;         // Cor neutra
+
+//+------------------------------------------------------------------+
+//| VARIÁVEIS GLOBAIS                                                 |
+//+------------------------------------------------------------------+
+AtivoConfig   ativos[];
+int           g_totalLinhas;
+bool          g_modoNetting   = false;
+bool          g_eaPausado     = false;
+datetime      g_ultimoTimer   = 0;
+
+CTrade        trade;
+CPositionInfo posInfo;
+CSymbolInfo   symInfo;
+
+const string  PREFIXO = "LoriDash_";
+datetime      g_ultimoCheck    = 0;
+datetime      g_ultimaSync     = 0;
+int           g_ultimoSegundo  = -1;
+
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                    |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Valida os inputs antes de iniciar                                  |
+//+------------------------------------------------------------------+
+bool ValidarInputs()
+  {
+   bool ok = true;
+
+   if(InpNumeroLinhas < 1 || InpNumeroLinhas > 50)
+     {
+      Print("❌ ERRO: InpNumeroLinhas deve estar entre 1 e 50.");
+      ok = false;
+     }
+
+   if(InpPeriodoMM9 <= 0 || InpPeriodoMM32 <= 0 || InpPeriodoMM100 <= 0)
+     {
+      Print("❌ ERRO: Períodos das médias devem ser > 0.");
+      ok = false;
+     }
+
+   if(InpPeriodoMM9 >= InpPeriodoMM32)
+     {
+      Print("⚠️ AVISO: InpPeriodoMM9 >= InpPeriodoMM32. O cruzamento pode não funcionar bem.");
+     }
+
+   if(InpPeriodoMM32 >= InpPeriodoMM100)
+     {
+      Print("⚠️ AVISO: InpPeriodoMM32 >= InpPeriodoMM100. A condição '< MM100' pode nunca ser verdadeira.");
+     }
+
+   if(InpSlippage < 0)
+     {
+      Print("❌ ERRO: InpSlippage deve ser >= 0.");
+      ok = false;
+     }
+
+   if(InpSegundosCheck < 1)
+     {
+      Print("❌ ERRO: InpSegundosCheck deve ser >= 1.");
+      ok = false;
+     }
+
+   if(InpUsarHorario)
+     {
+      if(InpHoraInicio < 0 || InpHoraInicio > 23 || InpHoraFim < 0 || InpHoraFim > 23)
+        {
+         Print("❌ ERRO: Horas devem estar entre 0 e 23.");
+         ok = false;
+        }
+     }
+
+   if(InpPercentualLucro <= 0.0 && InpTipoSaida == SAIDA_PERCENTUAL)
+     {
+      Print("❌ ERRO: InpPercentualLucro deve ser > 0 quando tipo de saída é percentual.");
+      ok = false;
+     }
+
+   return ok;
+  }
+
+//+------------------------------------------------------------------+
+//| Log controlado (respeita InpLogDetalhado)                          |
+//+------------------------------------------------------------------+
+void LogDetalhado(string msg)
+  {
+   if(InpLogDetalhado)
+      Print(msg);
+  }
+
+int OnInit()
+  {
+   //--- Valida inputs primeiro
+   if(!ValidarInputs())
+     {
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   long modo = AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   g_modoNetting = (modo == ACCOUNT_MARGIN_MODE_RETAIL_NETTING);
+
+   PrintFormat("EA iniciado. Modo da conta: %s",
+               g_modoNetting ? "NETTING" : "HEDGING");
+
+   g_totalLinhas = InpNumeroLinhas;
+   ArrayResize(ativos, g_totalLinhas);
+
+   trade.SetExpertMagicNumber(InpMagicBase);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   int carregados = ParsearListaAtivos();
+   if(carregados == 0)
+     {
+      Print("ERRO: Nenhum ativo carregado. Verifique a lista.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   PrintFormat("Total de ativos carregados: %d", carregados);
+
+   //--- Carrega histórico do CSV
+   CarregarCSV();
+   ReconstruirControle();
+
+   //--- Sincroniza com posições reais do MT5
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      if(ativos[i].simbolo == "") continue;
+      SincronizarEntradas(i);
+      AtualizarPosicaoReal(i);
+     }
+
+   CriarPainel();
+   EventSetTimer(5);
+
+   g_ultimoCheck = 0;
+   g_ultimaSync  = TimeCurrent();
+
+   Print("OnInit concluído com sucesso.");
+   return(INIT_SUCCEEDED);
+  } 
+
+  
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   //--- Salva estado atual antes de sair
+   SalvarCSV();
+
+   EventKillTimer();
+   LimparObjetos();
+   Print("EA finalizado. Motivo: ", reason, " | CSV salvo.");
+  }
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   //--- Controle de performance: só roda a cada N segundos
+   datetime agora = TimeCurrent();
+   if(agora - g_ultimoCheck < InpSegundosCheck)
+      return;
+
+   g_ultimoCheck = agora;
+
+   //--- 1) Verifica saídas primeiro (proteção)
+   ExecutarSaidas();
+
+   //--- 2) Depois verifica entradas
+   ExecutarAuto();
+  }
+
+//+------------------------------------------------------------------+
+//| Timer function (5s)                                               |
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   double total = 0.0;
+
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      if(ativos[i].simbolo == "") continue;
+
+      if(InpModoEA == MODO_SWING)
+         VerificarNovoDia(i);
+
+      AtualizarFiltroD1(i);
+      AtualizarGatilhoM5(i);
+      AtualizarPosicaoReal(i);
+      SincronizarEntradas(i);
+      AtualizarIndicadoresVisuais(i);
+
+      string nomeContr = PREFIXO + "contr_" + IntegerToString(i);
+      string nomeValor = PREFIXO + "valor_" + IntegerToString(i);
+
+      AtualizarCelula(nomeContr, DoubleToString(ativos[i].volumeAtual, 2));
+
+      color corValor = InpCorTexto;
+      if(ativos[i].pnlAtual > 0.0)      corValor = InpCorVerde;
+      else if(ativos[i].pnlAtual < 0.0) corValor = InpCorVermelho;
+
+      AtualizarCelula(nomeValor, DoubleToString(ativos[i].pnlAtual, 2), corValor);
+
+      total += ativos[i].pnlAtual;
+     }
+
+   color corTotal = InpCorTexto;
+   if(total > 0.0)      corTotal = InpCorVerde;
+   else if(total < 0.0) corTotal = InpCorVermelho;
+
+   AtualizarCelula(PREFIXO + "total_lbl", "TOTAL: " + DoubleToString(total, 2), corTotal);
+
+      //--- Status do EA
+   string statusTxt = "ON";
+   color  statusCor = InpCorVerde;
+
+   bool foraHorario = (InpUsarHorario && !DentroDoHorario() && InpModoEA == MODO_DAYTRADE);
+
+   if(g_eaPausado && foraHorario)
+     {
+      statusTxt = "P/FR";
+      statusCor = clrOrange;
+     }
+   else if(g_eaPausado)
+     {
+      statusTxt = "PAUS";
+      statusCor = InpCorVermelho;
+     }
+   else if(foraHorario)
+     {
+      statusTxt = "F/HR";
+      statusCor = clrOrange;
+     }
+
+   AtualizarCelula(PREFIXO + "status", statusTxt, statusCor);
+
+   //--- Salva CSV periodicamente
+   SalvarCSV();
+
+   ChartRedraw();
+  }
+ 
+ 
+  
+//+------------------------------------------------------------------+
+//| ChartEvent function                                               |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam)
+  {
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+
+   //--- PAUSAR
+   if(sparam == PREFIXO + "pausar")
+     {
+      g_eaPausado = !g_eaPausado;
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      PrintFormat("EA %s.", g_eaPausado ? "PAUSADO" : "RETOMADO");
+      return;
+     }
+
+   //--- FECHAR TUDO
+   if(sparam == PREFIXO + "fechar_tudo")
+      //--- SALVAR CSV
+   if(sparam == PREFIXO + "salvar")
+     {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      SalvarCSV();
+      Print("💾 CSV salvo manualmente.");
+      return;
+     }
+     
+        //--- EMERG: fecha tudo + pausa + salva
+   if(sparam == PREFIXO + "emerg")
+     {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      Print("🚨 EMERGÊNCIA: fechando tudo e pausando EA...");
+
+      int totalFechadas = 0;
+      for(int i = 0; i < g_totalLinhas; i++)
+        {
+         if(ativos[i].simbolo == "") continue;
+         if(FecharTudoDoAtivo(i)) totalFechadas++;
+        }
+
+      g_eaPausado = true;
+      SalvarCSV();
+
+      PrintFormat("🚨 EMERGÊNCIA concluída. %d ativo(s) fechado(s). EA PAUSADO.",
+                  totalFechadas);
+      return;
+     }
+     
+     {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      Print("FECHAR TUDO acionado...");
+      int totalFechadas = 0;
+      for(int i = 0; i < g_totalLinhas; i++)
+        {
+         if(ativos[i].simbolo == "") continue;
+         if(FecharTudoDoAtivo(i)) totalFechadas++;
+        }
+      PrintFormat("Total de ativos com posições fechadas: %d", totalFechadas);
+      return;
+     }
+
+   //--- Botões por linha
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      string sfx = "_" + IntegerToString(i);
+
+      if(sparam == PREFIXO + "buy" + sfx)
+        {
+         ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+         AbrirOrdem(i, ORDER_TYPE_BUY);
+         return;
+        }
+      if(sparam == PREFIXO + "sell" + sfx)
+        {
+         ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+         AbrirOrdem(i, ORDER_TYPE_SELL);
+         return;
+        }
+      if(sparam == PREFIXO + "f" + sfx)
+        {
+         ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+         FecharTudoDoAtivo(i);
+         return;
+        }
+      if(sparam == PREFIXO + "f1" + sfx)
+        {
+         ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+         FecharUltimaEntrada(i);
+         return;
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Lê valor de uma string separada por vírgula na posição index      |
+//+------------------------------------------------------------------+
+double LerValorLista(string lista, int index, double padrao)
+  {
+   string partes[];
+   int total = StringSplit(lista, ',', partes);
+   if(total <= index) return padrao;
+
+   string s = partes[index];
+   StringTrimLeft(s);
+   StringTrimRight(s);
+   if(StringLen(s) == 0) return padrao;
+
+   return StringToDouble(s);
+  }
+
+
+//+------------------------------------------------------------------+
+//| Parse da lista de símbolos                                        |
+//+------------------------------------------------------------------+
+int ParsearListaAtivos()
+  {
+   string lista = InpListaAtivos;
+   StringTrimLeft(lista);
+   StringTrimRight(lista);
+
+   if(StringLen(lista) == 0)
+     {
+      Print("ERRO: Lista de ativos vazia.");
+      return 0;
+     }
+
+   string partes[];
+   int total = StringSplit(lista, ',', partes);
+
+   if(total <= 0)
+     {
+      Print("ERRO: Falha ao dividir lista de ativos.");
+      return 0;
+     }
+
+   if(total != g_totalLinhas)
+     {
+      PrintFormat("AVISO: Input tinha %d linhas, mas a lista tem %d símbolos. Ajustando.",
+                  g_totalLinhas, total);
+      g_totalLinhas = total;
+      ArrayResize(ativos, g_totalLinhas);
+     }
+
+   int contador = 0;
+   for(int i = 0; i < total; i++)
+     {
+      string sym = partes[i];
+      StringTrimLeft(sym);
+      StringTrimRight(sym);
+      StringToUpper(sym);
+
+      if(StringLen(sym) == 0) continue;
+
+      if(!SymbolSelect(sym, true))
+        {
+         PrintFormat("AVISO: Símbolo '%s' não encontrado. Ignorando.", sym);
+         continue;
+        }
+
+      ativos[contador].simbolo           = sym;
+      ativos[contador].magic             = InpMagicBase + contador + 1;
+      ativos[contador].loteManual        = LerValorLista(InpListaLotes,    contador, 0.01);
+      ativos[contador].maxContratosDia   = LerValorLista(InpListaMaxDia,   contador, 100.0);
+      ativos[contador].maxContratosTotal = LerValorLista(InpListaMaxTotal, contador, 100.0);
+      ativos[contador].filtroD1OK        = false;
+      ativos[contador].gatilhoEntradaOK  = false;
+      ativos[contador].gatilhoSaidaOK    = false;
+      ativos[contador].volumeAtual       = 0.0;
+      ativos[contador].pnlAtual          = 0.0;
+      ativos[contador].ultimaEntrada     = 0;
+      ativos[contador].entradasHoje      = 0;
+      ativos[contador].diaReferencia     = 0;
+      ArrayResize(ativos[contador].entradas, 0);
+
+      if(!CriarHandles(contador))
+        {
+         PrintFormat("AVISO: Falha nos handles de %s. Linha será ignorada.", sym);
+         ativos[contador].simbolo = "";
+         continue;
+        }
+
+      PrintFormat("Ativo [%d] %s carregado (magic %d, lote %s, maxDia %s, maxTotal %s).",
+                  contador, sym, ativos[contador].magic,
+                  DoubleToString(ativos[contador].loteManual, 2),
+                  DoubleToString(ativos[contador].maxContratosDia, 2),
+                  DoubleToString(ativos[contador].maxContratosTotal, 2));
+      contador++;
+     }
+
+   return contador;
+  }
+
+//+------------------------------------------------------------------+
+//| Lê o valor de um buffer de indicador na barra especificada         |
+//+------------------------------------------------------------------+
+double LerBuffer(int handle, int buffer, int shift)
+  {
+   if(handle == INVALID_HANDLE) return 0.0;
+
+   double buf[];
+   if(CopyBuffer(handle, buffer, shift, 1, buf) <= 0) return 0.0;
+
+   return buf[0];
+  }
+
+//+------------------------------------------------------------------+
+//| Atualiza o filtro D1 de um ativo                                   |
+//| Condição: Preço D1 > MM9 D1                                        |
+//+------------------------------------------------------------------+
+void AtualizarFiltroD1(int index)
+  {
+   if(ativos[index].simbolo == "") return;
+
+   double mm9 = LerBuffer(ativos[index].hMM9_D1, 0, 0);
+   double precoD1 = iClose(ativos[index].simbolo, PERIOD_D1, 0);
+
+   if(mm9 == 0.0 || precoD1 == 0.0)
+     {
+      ativos[index].filtroD1OK = false;
+      return;
+     }
+
+   ativos[index].filtroD1OK = (precoD1 > mm9);
+  }
+
+//+------------------------------------------------------------------+
+//| Atualiza o gatilho M5 de um ativo                                  |
+//| Condição: MM9 < MM100 E MM32 < MM100 E MM9 cruzou MM32 para cima  |
+//+------------------------------------------------------------------+
+void AtualizarGatilhoM5(int index)
+  {
+   if(ativos[index].simbolo == "") return;
+
+   double mm9_0   = LerBuffer(ativos[index].hMM9_M5,   0, 0);
+   double mm9_1   = LerBuffer(ativos[index].hMM9_M5,   0, 1);
+   double mm32_0  = LerBuffer(ativos[index].hMM32_M5,  0, 0);
+   double mm32_1  = LerBuffer(ativos[index].hMM32_M5,  0, 1);
+   double mm100_0 = LerBuffer(ativos[index].hMM100_M5, 0, 0);
+
+   if(mm9_0 == 0.0 || mm32_0 == 0.0 || mm100_0 == 0.0)
+     {
+      ativos[index].gatilhoEntradaOK = false;
+      return;
+     }
+
+   bool ambosAbaixo = (mm9_0 < mm100_0) && (mm32_0 < mm100_0);
+   bool cruzouAcima = (mm9_1 <= mm32_1) && (mm9_0 > mm32_0);
+
+   ativos[index].gatilhoEntradaOK = (ambosAbaixo && cruzouAcima);
+  }
+
+//+------------------------------------------------------------------+
+//| Atualiza os indicadores visuais (D1 e GAT) de uma linha            |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Abre uma ordem no ativo (compra ou venda)                          |
+//+------------------------------------------------------------------+
+bool AbrirOrdem(int index, ENUM_ORDER_TYPE tipo)
+  {
+   if(index < 0 || index >= g_totalLinhas) return false;
+
+   string sym  = ativos[index].simbolo;
+   double lote = ativos[index].loteManual;
+
+   if(sym == "" || lote <= 0.0)
+     {
+      PrintFormat("ERRO: Ativo %d inválido para abrir ordem.", index);
+      return false;
+     }
+
+   //--- Normaliza volume ao step do símbolo
+   symInfo.Name(sym);
+   symInfo.RefreshRates();
+   double step = symInfo.LotsStep();
+   double minLot = symInfo.LotsMin();
+   double maxLot = symInfo.LotsMax();
+
+   lote = MathFloor(lote / step) * step;
+   if(lote < minLot) lote = minLot;
+   if(lote > maxLot) lote = maxLot;
+
+   //--- Define magic desta linha
+   trade.SetExpertMagicNumber(ativos[index].magic);
+
+   //--- Envia ordem
+   bool ok = false;
+   if(tipo == ORDER_TYPE_BUY)
+      ok = trade.Buy(lote, sym, 0.0, 0.0, 0.0, "LoriBoard Buy");
+   else
+      ok = trade.Sell(lote, sym, 0.0, 0.0, 0.0, "LoriBoard Sell");
+
+   if(!ok)
+     {
+      PrintFormat("ERRO ao abrir %s em %s: %d - %s",
+                  tipo == ORDER_TYPE_BUY ? "BUY" : "SELL",
+                  sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      return false;
+     }
+
+   //--- Registra entrada no array
+   ulong ticket = trade.ResultOrder();
+   ulong dealTicket = trade.ResultDeal();
+
+   //--- Espera a posição aparecer
+   Sleep(100);
+
+   //--- Encontra o ticket da posição
+   ulong posTicket = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Symbol() == sym && posInfo.Magic() == ativos[index].magic)
+           {
+            posTicket = posInfo.Ticket();
+            break;
+           }
+        }
+     }
+
+   if(posTicket == 0)
+     {
+      PrintFormat("AVISO: Ordem enviada mas posição não encontrada para %s.", sym);
+      return true; // a ordem foi aceita, apenas não localizamos a posição
+     }
+
+   //--- Adiciona ao array de entradas
+   int n = ArraySize(ativos[index].entradas);
+   ArrayResize(ativos[index].entradas, n + 1);
+   ativos[index].entradas[n].ticket        = posTicket;
+   ativos[index].entradas[n].volume        = lote;
+   ativos[index].entradas[n].dataAbertura  = TimeCurrent();
+   ativos[index].entradas[n].precoEntrada  = posInfo.PriceOpen();
+   ativos[index].entradas[n].ativa         = true;
+
+   //--- Atualiza contadores
+   ativos[index].ultimaEntrada = TimeCurrent();
+   ativos[index].entradasHoje++;
+
+   PrintFormat("✅ %s aberto em %s | lote %.2f | ticket %I64u | magic %d",
+               tipo == ORDER_TYPE_BUY ? "BUY" : "SELL",
+               sym, lote, posTicket, ativos[index].magic);
+
+ //--- Persiste no CSV
+   SalvarCSV();
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Fecha TODAS as entradas de um ativo                                |
+//+------------------------------------------------------------------+
+bool FecharTudoDoAtivo(int index)
+  {
+   if(index < 0 || index >= g_totalLinhas) return false;
+
+   string sym = ativos[index].simbolo;
+   if(sym == "") return false;
+
+   trade.SetExpertMagicNumber(ativos[index].magic);
+
+   int fechadas = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Symbol() == sym && posInfo.Magic() == ativos[index].magic)
+           {
+            if(trade.PositionClose(posInfo.Ticket()))
+              {
+               fechadas++;
+              }
+            else
+              {
+               PrintFormat("ERRO ao fechar ticket %I64u: %d - %s",
+                           posInfo.Ticket(), trade.ResultRetcode(),
+                           trade.ResultRetcodeDescription());
+              }
+           }
+        }
+     }
+
+   if(fechadas > 0)
+     {
+      PrintFormat("✅ %d posição(ões) fechada(s) em %s", fechadas, sym);
+      //--- Marca entradas como inativas
+      for(int j = 0; j < ArraySize(ativos[index].entradas); j++)
+         ativos[index].entradas[j].ativa = false;
+     }
+
+   //--- Persiste no CSV
+   SalvarCSV();
+   
+   return (fechadas > 0);
+  }
+
+//+------------------------------------------------------------------+
+//| Fecha SOMENTE a última entrada de um ativo                        |
+//+------------------------------------------------------------------+
+bool FecharUltimaEntrada(int index)
+  {
+   if(index < 0 || index >= g_totalLinhas) return false;
+
+   string sym = ativos[index].simbolo;
+   if(sym == "") return false;
+
+   trade.SetExpertMagicNumber(ativos[index].magic);
+
+   //--- Percorre de trás para frente (última primeiro)
+   ulong ultimoTicket = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Symbol() == sym && posInfo.Magic() == ativos[index].magic)
+           {
+            ultimoTicket = posInfo.Ticket();
+            break;
+           }
+        }
+     }
+
+   if(ultimoTicket == 0)
+     {
+      PrintFormat("AVISO: Nenhuma posição aberta em %s", sym);
+      return false;
+     }
+
+   if(trade.PositionClose(ultimoTicket))
+     {
+      //--- Marca a última entrada ativa como inativa
+      for(int j = ArraySize(ativos[index].entradas) - 1; j >= 0; j--)
+        {
+         if(ativos[index].entradas[j].ativa)
+           {
+            ativos[index].entradas[j].ativa = false;
+            break;
+           }
+        }
+      PrintFormat("✅ Última entrada fechada em %s (ticket %I64u)", sym, ultimoTicket);
+      return true;
+     }
+      //--- Persiste no CSV
+      SalvarCSV();
+      
+   PrintFormat("ERRO ao fechar última entrada de %s: %d - %s",
+               sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Atualiza volume e P&L de um ativo consultando posições reais       |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Verifica se pode abrir uma nova entrada em um ativo               |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Verifica se o ativo atingiu alguma condição de saída              |
+//+------------------------------------------------------------------+
+bool DeveFechar(int index)
+  {
+   if(index < 0 || index >= g_totalLinhas) return false;
+   if(ativos[index].simbolo == "")          return false;
+   if(ativos[index].volumeAtual <= 0.0)     return false;
+
+   string sym = ativos[index].simbolo;
+
+   //--- SAÍDA NUNCA
+   if(InpTipoSaida == SAIDA_NUNCA) return false;
+
+   //--- SAÍDA POR HORÁRIO
+   if(InpTipoSaida == SAIDA_HORARIO)
+     {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      int minutosAgora = dt.hour * 60 + dt.min;
+      int minutosFim   = InpHoraFim * 60 + InpMinutoFim;
+      return (minutosAgora >= minutosFim);
+     }
+
+   //--- SAÍDA POR CRUZAMENTO INVERSO (MM9 cruza MM32 para baixo)
+   if(InpTipoSaida == SAIDA_CRUZ_INVERSO)
+     {
+      double mm9_0  = LerBuffer(ativos[index].hMM9_M5,  0, 0);
+      double mm9_1  = LerBuffer(ativos[index].hMM9_M5,  0, 1);
+      double mm32_0 = LerBuffer(ativos[index].hMM32_M5, 0, 0);
+      double mm32_1 = LerBuffer(ativos[index].hMM32_M5, 0, 1);
+
+      bool cruzouAbaixo = (mm9_1 >= mm32_1) && (mm9_0 < mm32_0);
+      return cruzouAbaixo;
+     }
+
+   //--- SAÍDA POR MÁXIMA DAS N BARRAS
+   if(InpTipoSaida == SAIDA_MAX_N_BARRAS)
+     {
+      double close0 = iClose(sym, InpTF_Saida, 0);
+      if(close0 == 0.0) return false;
+
+      //--- Pega a maior máxima das últimas N barras (ignora a barra atual)
+      double highs[];
+      if(CopyHigh(sym, InpTF_Saida, 1, InpNumBarrasSaida, highs) <= 0)
+         return false;
+
+      int maiorIdx = ArrayMaximum(highs);
+      double maiorHigh = highs[maiorIdx];
+
+      return (close0 > maiorHigh);
+     }
+
+   //--- SAÍDA POR PERCENTUAL DE LUCRO
+   if(InpTipoSaida == SAIDA_PERCENTUAL)
+     {
+      //--- Calcula % de lucro sobre o preço médio da posição
+      double precoMedio = 0.0;
+      double volumeTotal = 0.0;
+      double lucroTotal  = 0.0;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         if(posInfo.SelectByIndex(i))
+           {
+            if(posInfo.Symbol() == sym && posInfo.Magic() == ativos[index].magic)
+              {
+               precoMedio  += posInfo.PriceOpen() * posInfo.Volume();
+               volumeTotal += posInfo.Volume();
+               lucroTotal  += posInfo.Profit() + posInfo.Swap();
+              }
+           }
+        }
+
+      if(volumeTotal == 0.0) return false;
+      precoMedio /= volumeTotal;
+
+      //--- Calcula variação percentual do preço
+      double precoAtual = SymbolInfoDouble(sym, SYMBOL_BID);
+      if(precoAtual == 0.0 || precoMedio == 0.0) return false;
+
+      double variacaoPct = ((precoAtual - precoMedio) / precoMedio) * 100.0;
+
+      //--- Considera posição comprada (buy)
+      if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         return (variacaoPct >= InpPercentualLucro);
+      else
+         return (variacaoPct <= -InpPercentualLucro);
+     }
+
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Loop de verificação de saída automática                           |
+//+------------------------------------------------------------------+
+void ExecutarSaidas()
+  {
+   //--- Verifica se passou do horário de fechamento (daytrade)
+   bool passouHorario = false;
+   if(InpModoEA == MODO_DAYTRADE && InpUsarHorario)
+     {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      int minutosAgora = dt.hour * 60 + dt.min;
+      int minutosFim   = InpHoraFim * 60 + InpMinutoFim;
+      passouHorario = (minutosAgora >= minutosFim);
+     }
+
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      if(ativos[i].simbolo == "") continue;
+      if(ativos[i].volumeAtual <= 0.0) continue;
+
+      //--- 1) Saída por horário (proteção daytrade)
+      if(passouHorario)
+        {
+         LogDetalhado("⏰ Fechando " + ativos[i].simbolo + " por horário (daytrade).");
+         FecharTudoDoAtivo(i);
+         continue;
+        }
+
+      //--- 2) Saída configurada
+      if(DeveFechar(i))
+        {
+         PrintFormat("🚪 Saída acionada em %s (magic %d) — fechando tudo",
+                     ativos[i].simbolo, ativos[i].magic);
+         FecharTudoDoAtivo(i);
+        }
+     }
+  }
+
+bool PodeAbrirEntrada(int index)
+  {
+   if(index < 0 || index >= g_totalLinhas) return false;
+   if(ativos[index].simbolo == "")          return false;
+   if(g_eaPausado)                          return false;
+   if(!DentroDoHorario())                   return false;
+   if(!ativos[index].filtroD1OK)            return false;
+   if(!ativos[index].gatilhoEntradaOK)      return false;
+
+   double volumeAtual = ativos[index].volumeAtual;
+   double lote        = ativos[index].loteManual;
+
+   //--- MODO DAYTRADE: 1 posição por ativo, sem reentrada
+   if(InpModoEA == MODO_DAYTRADE)
+     {
+      if(volumeAtual > 0.0) return false;
+     }
+
+   //--- MODO SWING: 1 entrada por dia (permite acumular posições antigas)
+   if(InpModoEA == MODO_SWING)
+     {
+      if(ativos[index].entradasHoje > 0)
+        {
+         return false;
+        }
+     }
+
+   //--- Verifica limites de contratos
+   if(volumeAtual + lote > ativos[index].maxContratosDia)   return false;
+   if(volumeAtual + lote > ativos[index].maxContratosTotal) return false;
+
+   return true;
+  }
+ 
+
+//+------------------------------------------------------------------+
+//| Loop de execução automática (chamado no OnTick)                    |
+//+------------------------------------------------------------------+
+void ExecutarAuto()
+  {
+   if(g_eaPausado) return;
+
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      if(ativos[i].simbolo == "") continue;
+
+      //--- Atualiza posição real antes de decidir
+      AtualizarPosicaoReal(i);
+
+      if(PodeAbrirEntrada(i))
+        {
+         PrintFormat("🎯 Sinal automático em %s (magic %d) — abrindo BUY",
+                     ativos[i].simbolo, ativos[i].magic);
+         AbrirOrdem(i, ORDER_TYPE_BUY);
+        }
+     }
+  }
+//+------------------------------------------------------------------+
+//| Sincroniza o array de entradas com as posições reais do MT5       |
+//| (remove entradas que foram fechadas manualmente)                   |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Caminho do arquivo de histórico                                   |
+//+------------------------------------------------------------------+
+string CaminhoCSV()
+  {
+   return "LoriBoard_historico.csv";
+  }
+
+//+------------------------------------------------------------------+
+//| Salva todo o histórico no CSV                                     |
+//+------------------------------------------------------------------+
+void SalvarCSV()
+  {
+   int handle = FileOpen(CaminhoCSV(), FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
+   if(handle == INVALID_HANDLE)
+     {
+      PrintFormat("ERRO ao abrir CSV para escrita: %d", GetLastError());
+      return;
+     }
+
+   //--- Cabeçalho
+   FileWrite(handle, "simbolo", "magic", "ticket", "volume",
+             "dataAbertura", "precoEntrada", "ativa");
+
+   //--- Linhas
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      if(ativos[i].simbolo == "") continue;
+
+      int n = ArraySize(ativos[i].entradas);
+      for(int j = 0; j < n; j++)
+        {
+         FileWrite(handle,
+                   ativos[i].simbolo,
+                   IntegerToString(ativos[i].magic),
+                   IntegerToString(ativos[i].entradas[j].ticket),
+                   DoubleToString(ativos[i].entradas[j].volume, 2),
+                   TimeToString(ativos[i].entradas[j].dataAbertura, TIME_DATE | TIME_SECONDS),
+                   DoubleToString(ativos[i].entradas[j].precoEntrada, _Digits),
+                   ativos[i].entradas[j].ativa ? "true" : "false");
+        }
+     }
+
+   FileClose(handle);
+  }
+
+//+------------------------------------------------------------------+
+//| Carrega o histórico do CSV                                        |
+//+------------------------------------------------------------------+
+void CarregarCSV()
+  {
+   string caminho = CaminhoCSV();
+   if(!FileIsExist(caminho)) 
+     {
+      Print("CSV de histórico ainda não existe. Começando do zero.");
+      return;
+     }
+
+   int handle = FileOpen(caminho, FILE_READ | FILE_CSV | FILE_ANSI, ';');
+   if(handle == INVALID_HANDLE)
+     {
+      PrintFormat("ERRO ao abrir CSV para leitura: %d", GetLastError());
+      return;
+     }
+
+   int linha = 0;
+   int carregadas = 0;
+
+   while(!FileIsEnding(handle))
+     {
+      string simbolo    = FileReadString(handle);
+      string magicStr   = FileReadString(handle);
+      string ticketStr  = FileReadString(handle);
+      string volumeStr  = FileReadString(handle);
+      string dataStr    = FileReadString(handle);
+      string precoStr   = FileReadString(handle);
+      string ativaStr   = FileReadString(handle);
+
+      linha++;
+
+      //--- Pula cabeçalho
+      if(linha == 1) continue;
+
+      //--- Pula linha vazia
+      if(StringLen(simbolo) == 0) continue;
+
+      //--- Encontra o índice do ativo na lista atual
+      int idx = -1;
+      for(int i = 0; i < g_totalLinhas; i++)
+        {
+         if(ativos[i].simbolo == simbolo)
+           {
+            idx = i;
+            break;
+           }
+        }
+
+      if(idx < 0) continue; // símbolo não está mais na lista
+
+      //--- Monta EntradaInfo
+      EntradaInfo ei;
+      ei.ticket        = (ulong)StringToInteger(ticketStr);
+      ei.volume        = StringToDouble(volumeStr);
+      ei.dataAbertura  = StringToTime(dataStr);
+      ei.precoEntrada  = StringToDouble(precoStr);
+      ei.ativa         = (ativaStr == "true");
+
+      //--- Adiciona ao array
+      int n = ArraySize(ativos[idx].entradas);
+      ArrayResize(ativos[idx].entradas, n + 1);
+      ativos[idx].entradas[n] = ei;
+
+      carregadas++;
+     }
+
+   FileClose(handle);
+   PrintFormat("CSV carregado: %d entradas restauradas.", carregadas);
+  }
+
+//+------------------------------------------------------------------+
+//| Reconstrói dados de controle a partir do histórico carregado      |
+//+------------------------------------------------------------------+
+void ReconstruirControle()
+  {
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      if(ativos[i].simbolo == "") continue;
+
+      int n = ArraySize(ativos[i].entradas);
+      if(n == 0) continue;
+
+      //--- Descobre a última entrada
+      datetime ultima = 0;
+      for(int j = 0; j < n; j++)
+        {
+         if(ativos[i].entradas[j].dataAbertura > ultima)
+            ultima = ativos[i].entradas[j].dataAbertura;
+        }
+      ativos[i].ultimaEntrada = ultima;
+
+      //--- Conta entradas de HOJE
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      dt.hour = 0; dt.min = 0; dt.sec = 0;
+      datetime hoje = StructToTime(dt);
+
+      int entradasHoje = 0;
+      for(int j = 0; j < n; j++)
+        {
+         if(ativos[i].entradas[j].dataAbertura >= hoje)
+            entradasHoje++;
+        }
+      ativos[i].entradasHoje  = entradasHoje;
+      ativos[i].diaReferencia = hoje;
+     }
+  }
+
+void SincronizarEntradas(int index)
+  {
+   if(index < 0 || index >= g_totalLinhas) return;
+
+   string sym = ativos[index].simbolo;
+   if(sym == "") return;
+
+   int n = ArraySize(ativos[index].entradas);
+   if(n == 0) return;
+
+   for(int j = 0; j < n; j++)
+     {
+      if(!ativos[index].entradas[j].ativa) continue;
+
+      ulong tk = ativos[index].entradas[j].ticket;
+      bool  existe = false;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         if(posInfo.SelectByIndex(i))
+           {
+            if(posInfo.Ticket() == tk)
+              {
+               existe = true;
+               break;
+              }
+           }
+        }
+
+      if(!existe)
+        {
+         ativos[index].entradas[j].ativa = false;
+         PrintFormat("🔄 Entrada ticket %I64u de %s foi fechada (sincronização).",
+                     tk, sym);
+        }
+     }
+  }
+
+void AtualizarPosicaoReal(int index)
+  {
+   if(index < 0 || index >= g_totalLinhas) return;
+
+   string sym = ativos[index].simbolo;
+   if(sym == "") return;
+
+   double volumeTotal = 0.0;
+   double pnlTotal    = 0.0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(posInfo.SelectByIndex(i))
+        {
+         if(posInfo.Symbol() == sym && posInfo.Magic() == ativos[index].magic)
+           {
+            volumeTotal += posInfo.Volume();
+            pnlTotal    += posInfo.Profit() + posInfo.Swap();
+           }
+        }
+     }
+
+   ativos[index].volumeAtual = volumeTotal;
+   ativos[index].pnlAtual    = pnlTotal;
+  }
+
+void AtualizarIndicadoresVisuais(int index)
+  {
+   string nomeD1  = PREFIXO + "d1_"  + IntegerToString(index);
+   string nomeGat = PREFIXO + "gat_" + IntegerToString(index);
+
+   //--- Célula D1
+   color corD1 = ativos[index].filtroD1OK ? InpCorVerde : InpCorVermelho;
+   AtualizarCorFundo(nomeD1, corD1);
+   AtualizarCelula(nomeD1, ativos[index].filtroD1OK ? "OK" : "X", InpCorTexto);
+
+   //--- Célula GAT
+   if(ativos[index].gatilhoEntradaOK)
+     {
+      AtualizarCorFundo(nomeGat, InpCorVerde);
+      AtualizarCelula(nomeGat, "SIM", InpCorTexto);
+     }
+   else
+     {
+      AtualizarCorFundo(nomeGat, InpCorNeutro);
+      AtualizarCelula(nomeGat, "-", InpCorTexto);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Cria handles de indicadores para um ativo                         |
+//+------------------------------------------------------------------+
+bool CriarHandles(int index)
+  {
+   if(index < 0 || index >= g_totalLinhas) return false;
+
+   string sym = ativos[index].simbolo;
+   if(sym == "") return false;
+
+   if(!SymbolSelect(sym, true))
+     {
+      PrintFormat("ERRO: Símbolo %s não encontrado.", sym);
+      return false;
+     }
+
+   ativos[index].hMM9_M5    = iMA(sym, PERIOD_M5, InpPeriodoMM9,   0, MODE_EMA, PRICE_CLOSE);
+   ativos[index].hMM32_M5   = iMA(sym, PERIOD_M5, InpPeriodoMM32,  0, MODE_EMA, PRICE_CLOSE);
+   ativos[index].hMM100_M5  = iMA(sym, PERIOD_M5, InpPeriodoMM100, 0, MODE_EMA, PRICE_CLOSE);
+   ativos[index].hMM9_D1    = iMA(sym, PERIOD_D1, InpPeriodoMM9_D1, 0, MODE_EMA, PRICE_CLOSE);
+   ativos[index].hMM5_Saida = iMA(sym, InpTF_Saida, InpPeriodoMM5, 0, MODE_EMA, PRICE_HIGH);
+
+   if(ativos[index].hMM9_M5    == INVALID_HANDLE ||
+      ativos[index].hMM32_M5   == INVALID_HANDLE ||
+      ativos[index].hMM100_M5  == INVALID_HANDLE ||
+      ativos[index].hMM9_D1    == INVALID_HANDLE ||
+      ativos[index].hMM5_Saida == INVALID_HANDLE)
+     {
+      PrintFormat("ERRO: Falha ao criar handles para %s.", sym);
+      return false;
+     }
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Cria a estrutura do painel                                        |
+//+------------------------------------------------------------------+
+void CriarPainel()
+  {
+   int x = InpPainelX;
+   int y = InpPainelY;
+   int h = InpAlturaLinha;
+
+   CriarCelula(PREFIXO + "hdr_ticker", x,       y, 80, h, "TICKER",  InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_d1",     x + 80,  y, 40, h, "D1",      InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_gat",    x + 120, y, 50, h, "GAT",     InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_contr",  x + 170, y, 60, h, "CONTR",   InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_valor",  x + 230, y, 90, h, "VALOR $", InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_buy",    x + 320, y, 45, h, "BUY",     InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_sell",   x + 365, y, 45, h, "SELL",    InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_f",      x + 410, y, 40, h, "F",       InpCorFundo, InpCorTexto);
+   CriarCelula(PREFIXO + "hdr_f1",     x + 450, y, 40, h, "F1",      InpCorFundo, InpCorTexto);
+
+   for(int i = 0; i < g_totalLinhas; i++)
+     {
+      int ly = y + h * (i + 1);
+      string s = ativos[i].simbolo;
+
+      CriarCelula(PREFIXO + "ticker_" + IntegerToString(i), x,       ly, 80, h, (s == "" ? "-" : s), InpCorFundo, InpCorTexto);
+      CriarCelula(PREFIXO + "d1_"     + IntegerToString(i), x + 80,  ly, 40, h, " ",  InpCorNeutro, InpCorTexto);
+      CriarCelula(PREFIXO + "gat_"    + IntegerToString(i), x + 120, ly, 50, h, " ",  InpCorNeutro, InpCorTexto);
+      CriarCelula(PREFIXO + "contr_"  + IntegerToString(i), x + 170, ly, 60, h, "0",  InpCorFundo,  InpCorTexto);
+      CriarCelula(PREFIXO + "valor_"  + IntegerToString(i), x + 230, ly, 90, h, "0.00", InpCorFundo, InpCorTexto);
+
+      CriarBotao(PREFIXO + "buy_"  + IntegerToString(i), x + 320, ly, 45, h, "B");
+      CriarBotao(PREFIXO + "sell_" + IntegerToString(i), x + 365, ly, 45, h, "S");
+      CriarBotao(PREFIXO + "f_"    + IntegerToString(i), x + 410, ly, 40, h, "F");
+      CriarBotao(PREFIXO + "f1_"   + IntegerToString(i), x + 450, ly, 40, h, "F1");
+     }
+
+   int rodapeY = y + h * (g_totalLinhas + 1) + 5;
+
+       CriarCelula(PREFIXO + "total_lbl", x, rodapeY, 160, h + 4, "TOTAL: 0.00", InpCorFundo, InpCorTexto);
+   CriarBotao(PREFIXO + "pausar",      x + 165, rodapeY, 80, h + 4, "PAUSAR");
+   CriarBotao(PREFIXO + "fechar_tudo", x + 250, rodapeY, 100, h + 4, "FECHAR TUDO");
+   CriarBotao(PREFIXO + "salvar",      x + 355, rodapeY, 70, h + 4, "SALVAR");
+   CriarBotao(PREFIXO + "emerg",       x + 430, rodapeY, 80, h + 4, "EMERG");
+   CriarCelula(PREFIXO + "status",     x + 515, rodapeY, 60, h + 4, "ON", InpCorFundo, InpCorVerde);
+
+   //--- Pinta o botão EMERG de vermelho
+   ObjectSetInteger(0, PREFIXO + "emerg", OBJPROP_BGCOLOR, clrDarkRed);
+   ObjectSetInteger(0, PREFIXO + "emerg", OBJPROP_COLOR, clrWhite);
+   
+   ChartRedraw();
+  }
+  
+//+------------------------------------------------------------------+
+//| Cria uma célula (fundo + texto)                                   |
+//+------------------------------------------------------------------+
+void CriarCelula(string nome, int x, int y, int w, int h,
+                 string texto, color corFundo, color corTexto)
+  {
+   string nomeFundo = nome + "_bg";
+   if(ObjectFind(0, nomeFundo) < 0)
+      ObjectCreate(0, nomeFundo, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_YSIZE, h);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_BGCOLOR, corFundo);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_COLOR, clrDimGray);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_BACK, false);
+   ObjectSetInteger(0, nomeFundo, OBJPROP_SELECTABLE, false);
+
+   if(ObjectFind(0, nome) < 0)
+      ObjectCreate(0, nome, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, nome, OBJPROP_XDISTANCE, x + 4);
+   ObjectSetInteger(0, nome, OBJPROP_YDISTANCE, y + 3);
+   ObjectSetInteger(0, nome, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetString(0, nome, OBJPROP_TEXT, texto);
+   ObjectSetString(0, nome, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, nome, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, corTexto);
+   ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, nome, OBJPROP_BACK, false);
+  }
+
+//+------------------------------------------------------------------+
+//| Cria um botão                                                     |
+//+------------------------------------------------------------------+
+void CriarBotao(string nome, int x, int y, int w, int h, string texto)
+  {
+   if(ObjectFind(0, nome) < 0)
+      ObjectCreate(0, nome, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, nome, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, nome, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, nome, OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, nome, OBJPROP_YSIZE, h);
+   ObjectSetInteger(0, nome, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetString(0, nome, OBJPROP_TEXT, texto);
+   ObjectSetString(0, nome, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, nome, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, nome, OBJPROP_BGCOLOR, clrDimGray);
+   ObjectSetInteger(0, nome, OBJPROP_BORDER_COLOR, clrBlack);
+   ObjectSetInteger(0, nome, OBJPROP_STATE, false);
+   ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+  }
+
+//+------------------------------------------------------------------+
+//| Atualiza o texto de uma célula                                    |
+//+------------------------------------------------------------------+
+void AtualizarCelula(string nome, string texto, color corTexto = clrNONE)
+  {
+   if(ObjectFind(0, nome) < 0) return;
+   ObjectSetString(0, nome, OBJPROP_TEXT, texto);
+   if(corTexto != clrNONE)
+      ObjectSetInteger(0, nome, OBJPROP_COLOR, corTexto);
+  }
+
+//+------------------------------------------------------------------+
+//| Atualiza a cor de fundo de uma célula                             |
+//+------------------------------------------------------------------+
+void AtualizarCorFundo(string nome, color cor)
+  {
+   string nomeFundo = nome + "_bg";
+   if(ObjectFind(0, nomeFundo) < 0) return;
+   ObjectSetInteger(0, nomeFundo, OBJPROP_BGCOLOR, cor);
+  }
+
+//+------------------------------------------------------------------+
+//| Remove todos os objetos do painel                                 |
+//+------------------------------------------------------------------+
+void LimparObjetos()
+  {
+   ObjectsDeleteAll(0, PREFIXO);
+   ChartRedraw();
+  }
+
+//+------------------------------------------------------------------+
+//| Verifica se está dentro do horário permitido                      |
+//+------------------------------------------------------------------+
+bool DentroDoHorario()
+  {
+   if(!InpUsarHorario) return true;  // 24h / swing
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+
+   int minutosAgora  = dt.hour * 60 + dt.min;
+   int minutosInicio = InpHoraInicio * 60 + InpMinutoInicio;
+   int minutosFim    = InpHoraFim * 60 + InpMinutoFim;
+
+   return (minutosAgora >= minutosInicio && minutosAgora <= minutosFim);
+  }
+
+
+//+------------------------------------------------------------------+
+//| Detecta mudança de dia (para resetar contadores)                  |
+//+------------------------------------------------------------------+
+void VerificarNovoDia(int index)
+  {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+
+   datetime hoje = StructToTime(dt);
+
+   if(ativos[index].diaReferencia != hoje)
+     {
+      ativos[index].diaReferencia = hoje;
+      ativos[index].entradasHoje  = 0;
+     }
+  }
+//+------------------------------------------------------------------+
